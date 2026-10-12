@@ -1,0 +1,111 @@
+name: Compiled SDK reader verification
+
+on:
+  push:
+    branches: [codex/pr-3643-linux-reader-verification-20261013]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-linux-reader:
+    if: github.repository == 'oguzhanozfe/AnyPS5' && github.ref == 'refs/heads/codex/pr-3643-linux-reader-verification-20261013'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Configure actual registration with focused production components
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sdk-reader-harness"
+          cat > "$RUNNER_TEMP/sdk-reader-harness/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(CompiledSdkReaderVerification LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(BUILD_TESTING ON)
+          enable_testing()
+          set(LIBS_INCLUDE_DIR "${ANYPS5_SOURCE}/core/libs")
+          set(ANYPS5_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+          function(add_test_executable target)
+              add_executable(${target} ${ARGN})
+              set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+          endfunction()
+          function(configure_windows_unwind target)
+              if(WIN32)
+                  message(FATAL_ERROR "This verification harness requires Linux")
+              endif()
+          endfunction()
+          add_library(libc SHARED "${LIBS_INCLUDE_DIR}/prx/libc/src/ApplicationProcessParameters.cpp")
+          target_include_directories(libc PRIVATE "${LIBS_INCLUDE_DIR}")
+          target_link_libraries(libc PRIVATE ${CMAKE_DL_LIBS})
+          add_executable(nid_patcher EXCLUDE_FROM_ALL "${LIBS_INCLUDE_DIR}/nid/src/main.cpp")
+          add_subdirectory("${LIBS_INCLUDE_DIR}/prx/libkernel" libkernel)
+          set_property(TARGET libkernel PROPERTY SOURCES "${LIBS_INCLUDE_DIR}/prx/libkernel/System/src/CompiledSdkVersion.cpp")
+          CMAKE
+          uname -a
+          g++ --version
+          cmake --version
+          python3 --version
+          git rev-parse HEAD
+          sha256sum core/libs/prx/libc/src/ApplicationProcessParameters.cpp core/libs/prx/libkernel/System/src/CompiledSdkVersion.cpp core/libs/tests/CompiledSdkVersionProcess.cpp core/libs/tests/CompiledSdkVersionElfFixture.py core/libs/prx/libkernel/CMakeLists.txt
+          cmake -S "$RUNNER_TEMP/sdk-reader-harness" -B "$RUNNER_TEMP/sdk-reader-build" -DCMAKE_BUILD_TYPE=Release -DANYPS5_SOURCE="$GITHUB_WORKSPACE"
+      - name: Build only SDK fixtures and required production components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/sdk-reader-build" --target compiled_sdk_version_process_tests compiled_sdk_version_tests --parallel 1
+      - name: Check registered tests and actual ELF geometry
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/sdk-reader-build" --show-only=json-v1 > "$RUNNER_TEMP/sdk-reader-tests.json"
+          python3 - "$RUNNER_TEMP/sdk-reader-tests.json" <<'PY'
+          import json, sys
+          tests = {test['name']: test for test in json.load(open(sys.argv[1]))['tests']}
+          expected = {'compiled_sdk_version', 'compiled_sdk_version_process', 'compiled_sdk_version_process_missing', 'compiled_sdk_version_process_truncated', 'compiled_sdk_version_process_unmapped'}
+          assert expected <= tests.keys(), expected - tests.keys()
+          def properties(name):
+              return {item['name']: item['value'] for item in tests[name]['properties']}
+          assert properties('compiled_sdk_version_process')['FIXTURES_SETUP'] == ['compiled_sdk_process']
+          for mode in ('missing', 'truncated', 'unmapped'):
+              name = 'compiled_sdk_version_process_' + mode
+              assert properties(name)['FIXTURES_REQUIRED'] == ['compiled_sdk_process']
+              assert tests[name]['command'][0].endswith('.' + mode)
+              assert tests[name]['command'][1:] == ['reader-reject']
+          print('LINUX_CMAKE_REGISTRATION_PASS')
+          PY
+          image="$RUNNER_TEMP/sdk-reader-build/tests/compiled_sdk_version_process_tests"
+          for suffix in '' .missing .truncated .unmapped; do readelf -lW "$image$suffix"; done
+          python3 - "$image" <<'PY'
+          import struct, sys
+          from pathlib import Path
+          for mode in ('positive', 'missing', 'truncated', 'unmapped'):
+              image = Path(sys.argv[1] + ('' if mode == 'positive' else '.' + mode)).read_bytes()
+              phoff = struct.unpack_from('<Q', image, 32)[0]
+              size, count = struct.unpack_from('<HH', image, 54)
+              headers = [struct.unpack_from('<IIQQQQQQ', image, phoff + i * size) for i in range(count)]
+              metadata = [p for p in headers if p[0] == 0x61000001]
+              if mode == 'missing':
+                  assert not metadata
+                  continue
+              assert len(metadata) == 1
+              p = metadata[0]
+              assert p[5] == (0x3f if mode == 'truncated' else 0x40)
+              mapped = any(load[0] == 1 and load[3] <= p[3] and p[3] + p[5] <= load[3] + load[6] for load in headers)
+              assert mapped == (mode != 'unmapped')
+              if mode == 'positive':
+                  assert p[3] % 8 == 1
+          print('LINUX_ELF_GEOMETRY_PASS')
+          PY
+      - name: Execute real reader and separate parser fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/sdk-reader-build" -R '^compiled_sdk_version(_process.*)?$' --no-tests=error --timeout 20 --output-on-failure --verbose
+          echo LINUX_REAL_READER_FOCUSED_PASS
